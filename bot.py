@@ -312,7 +312,7 @@ class SilmirIndex:
             for info in zf.infolist():
                 if info.is_dir() or not info.filename.lower().endswith(".txt"):
                     continue
-                logger.info("Читаю словарь: %s", info.filename)
+                logger.debug("Читаю словарь: %s", info.filename)
                 with zf.open(info, "r") as raw:
                     stream = io.TextIOWrapper(raw, encoding="utf-8-sig", errors="replace")
                     for line in stream:
@@ -514,6 +514,7 @@ def looks_like_verb(silmir: str) -> bool:
 dp = Dispatcher()
 translator: SilmirTranslator | None = None
 index_global: SilmirIndex | None = None
+bot_username_global: str | None = None
 
 
 def get_translator(rebuild: bool = False) -> SilmirTranslator:
@@ -522,6 +523,60 @@ def get_translator(rebuild: bool = False) -> SilmirTranslator:
         index_global = ensure_index(rebuild=rebuild)
         translator = SilmirTranslator(index_global)
     return translator
+
+
+def normalize_bot_username(username: str | None) -> str:
+    return (username or "").lstrip("@").lower().strip()
+
+
+def is_group_message(message: Message) -> bool:
+    return message.chat.type in {"group", "supergroup"}
+
+
+def text_mentions_bot(text: str, bot_username: str | None) -> bool:
+    username = normalize_bot_username(bot_username)
+    if not username:
+        return False
+    return bool(re.search(rf"(?i)(^|\s)@{re.escape(username)}\b", text or ""))
+
+
+def strip_bot_mention(text: str, bot_username: str | None) -> str:
+    username = normalize_bot_username(bot_username)
+    cleaned = text or ""
+    if username:
+        cleaned = re.sub(rf"(?i)(^|\s)@{re.escape(username)}\b", " ", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    cleaned = re.sub(r"^[\s:,.!\-—–]+", "", cleaned).strip()
+    cleaned = re.sub(r"[\s:,.!\-—–]+$", "", cleaned).strip()
+    return cleaned
+
+
+def is_reply_to_this_bot(message: Message, bot_username: str | None) -> bool:
+    reply = message.reply_to_message
+    if not reply or not reply.from_user:
+        return False
+    username = normalize_bot_username(bot_username)
+    reply_username = normalize_bot_username(reply.from_user.username)
+    return bool(reply.from_user.is_bot and username and reply_username == username)
+
+
+def extract_text_for_translation(message: Message, bot_username: str | None) -> str | None:
+    """Private chats: translate any text. Groups: translate only @mention or reply to bot."""
+    text = (message.text or "").strip()
+    if not text:
+        return None
+
+    if not is_group_message(message):
+        return text
+
+    if text_mentions_bot(text, bot_username):
+        return strip_bot_mention(text, bot_username)
+
+    if is_reply_to_this_bot(message, bot_username):
+        return text
+
+    # В группах не трогаем обычные сообщения, чтобы бот не спамил.
+    return None
 
 
 async def send_long(message: Message, text: str) -> None:
@@ -541,32 +596,53 @@ def format_result(result: TranslationResult) -> str:
 
 @dp.message(Command("start"))
 async def start(message: Message) -> None:
+    logger.info("INCOMING /start from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
     await message.answer(
         "Привет. Напиши русский текст, и я переведу его на Sil'mir.\n\n"
         "Команды:\n"
         "/translate текст — перевести текст\n"
         "/status — проверить словарь\n"
-        "/reload — пересобрать индекс словаря"
+        "/reload — пересобрать индекс словаря\n\n"
+        "В группе напиши: @имя_бота я вижу камень. "
+        "Обычные сообщения в группах я игнорирую."
     )
 
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message) -> None:
+    logger.info("INCOMING /help from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
     await start(message)
+
+
+@dp.message(Command("ping"))
+async def ping(message: Message) -> None:
+    logger.info("INCOMING /ping from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
+    await message.answer("pong ✅ Бот получает сообщения.")
 
 
 @dp.message(Command("status"))
 async def status(message: Message) -> None:
+    logger.info("INCOMING /status from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
     try:
         zip_path = find_dictionary_zip()
-        idx = ensure_index(rebuild=False)
-        await message.answer(f"Словарь: {html.escape(zip_path.name)}\nЗаписей в индексе: {idx.count()}")
+        index_path = Path(os.getenv("SILMIR_INDEX", DEFAULT_INDEX_NAME))
+        if not index_path.is_absolute():
+            index_path = APP_DIR / index_path
+        idx = SilmirIndex(index_path)
+        if idx.has_index():
+            await message.answer(f"Словарь: {html.escape(zip_path.name)}\nИндекс готов. Записей: {idx.count()}")
+        else:
+            await message.answer(
+                f"Словарь найден: {html.escape(zip_path.name)}\n"
+                "Индекс ещё не построен. Отправь текст для перевода или команду /reload."
+            )
     except Exception as exc:  # noqa: BLE001
         await message.answer(f"Проблема со словарём: {html.escape(str(exc))}")
 
 
 @dp.message(Command("reload"))
 async def reload_dictionary(message: Message) -> None:
+    logger.info("INCOMING /reload from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
     await message.answer("Пересобираю индекс словаря...")
     try:
         get_translator(rebuild=True)
@@ -579,6 +655,7 @@ async def reload_dictionary(message: Message) -> None:
 
 @dp.message(Command("translate"))
 async def translate_command(message: Message) -> None:
+    logger.info("INCOMING /translate from id=%s username=%s text=%r", message.from_user.id if message.from_user else None, message.from_user.username if message.from_user else None, message.text)
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2 or not parts[1].strip():
         await message.answer("Напиши так: /translate я не вижу камень")
@@ -588,8 +665,18 @@ async def translate_command(message: Message) -> None:
 
 @dp.message(F.text)
 async def any_text(message: Message) -> None:
-    text = (message.text or "").strip()
+    logger.info(
+        "INCOMING text chat_type=%s from id=%s username=%s text=%r",
+        message.chat.type,
+        message.from_user.id if message.from_user else None,
+        message.from_user.username if message.from_user else None,
+        message.text,
+    )
+    text = extract_text_for_translation(message, bot_username_global)
+    if text is None:
+        return
     if not text:
+        await message.answer("Напиши запрос после упоминания, например: @имя_бота я вижу камень")
         return
     if not has_russian(text):
         await message.answer("Пока я перевожу только с русского на Sil'mir.")
@@ -599,6 +686,12 @@ async def any_text(message: Message) -> None:
 
 async def translate_text(message: Message, text: str) -> None:
     try:
+        # Если индекс ещё не готов, честно предупреждаем: первый запуск может занять время.
+        index_path = Path(os.getenv("SILMIR_INDEX", DEFAULT_INDEX_NAME))
+        if not index_path.is_absolute():
+            index_path = APP_DIR / index_path
+        if not SilmirIndex(index_path).has_index():
+            await message.answer("Первый запуск: собираю словарь. Это может занять 1–3 минуты, потом будет быстро.")
         result = get_translator().translate(text)
     except Exception as exc:  # noqa: BLE001
         logger.exception("Translation failed")
@@ -608,14 +701,27 @@ async def translate_text(message: Message, text: str) -> None:
 
 
 async def main() -> None:
+    global bot_username_global
+
     load_dotenv(APP_DIR / ".env")
     token = os.getenv("BOT_TOKEN", "").strip()
     if not token:
         raise RuntimeError("Нет BOT_TOKEN. Создай .env рядом с bot.py и вставь токен от @BotFather.")
 
-    get_translator(rebuild=os.getenv("SILMIR_REBUILD_INDEX", "0").lower() in {"1", "true", "yes", "да"})
+    # Важно: не строим словарь до запуска polling.
+    # Иначе на хостинге бот долго показывает только "Читаю словарь" и не отвечает даже на /start.
+    # Индекс строится лениво при первом переводе или через /reload.
+    if os.getenv("SILMIR_REBUILD_INDEX", "0").lower() in {"1", "true", "yes", "да"}:
+        logger.info("SILMIR_REBUILD_INDEX включён: индекс будет пересобран при первом переводе или /reload")
+
     bot = Bot(token=token)
-    await dp.start_polling(bot)
+    me = await bot.get_me()
+    bot_username_global = me.username
+    logger.info("Бот запущен: @%s, id=%s, name=%s", me.username, me.id, me.full_name)
+    # На случай, если ранее был включён webhook: polling и webhook вместе не работают.
+    await bot.delete_webhook(drop_pending_updates=False)
+    logger.info("Жду сообщения. Проверь /ping в Telegram.")
+    await dp.start_polling(bot, allowed_updates=dp.resolve_used_update_types())
 
 
 def cli() -> None:
